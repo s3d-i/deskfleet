@@ -1,0 +1,303 @@
+name: Self-hosted macOS build
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag (e.g. v0.18.2). Leave empty for latest upstream release."
+        type: string
+        required: false
+        default: ""
+      rebuild:
+        description: "Rebuild and overwrite assets even if selfhost-<tag> already exists."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selfhost-mac-${{ inputs.tag || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve upstream release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      linux_tarball_url: ${{ steps.check.outputs.linux_tarball_url }}
+      linux_tarball_sha256: ${{ steps.check.outputs.linux_tarball_sha256 }}
+    steps:
+      - name: Check upstream and fork releases
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            endpoint="repos/yet-another-ai/deskfleet/releases/tags/$INPUT_TAG"
+          else
+            endpoint="repos/yet-another-ai/deskfleet/releases/latest"
+          fi
+
+          release_json="$(gh api "$endpoint")"
+          is_draft="$(jq -r '.draft' <<<"$release_json")"
+          tag="$(jq -r '.tag_name' <<<"$release_json")"
+          if [[ "$is_draft" == "true" ]]; then
+            echo "::error::Upstream release $tag is a draft."
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected upstream tag format: $tag"
+            exit 1
+          fi
+
+          linux_url="$(jq -r '.assets[] | select(.name == "deskfleet-linux-x64.tar.gz") | .browser_download_url' <<<"$release_json")"
+          linux_digest="$(jq -r '.assets[] | select(.name == "deskfleet-linux-x64.tar.gz") | .digest // empty' <<<"$release_json")"
+          if [[ -z "$linux_url" || ! "$linux_digest" =~ ^sha256:([0-9a-f]{64})$ ]]; then
+            echo "::error::Upstream release $tag is missing deskfleet-linux-x64.tar.gz or its sha256 digest."
+            exit 1
+          fi
+          linux_sha256="${BASH_REMATCH[1]}"
+          version="${tag#v}"
+          release_tag="selfhost-${tag}"
+
+          if [[ "$REBUILD" != "true" ]] && existing_draft="$(gh api "repos/${FORK_REPO}/releases/tags/${release_tag}" --jq '.draft' 2>/dev/null)"; then
+            if [[ "$existing_draft" == "false" ]]; then
+              echo "Release ${release_tag} is already published on ${FORK_REPO}; skipping build."
+              {
+                echo "should_build=false"
+                echo "tag=$tag"
+                echo "version=$version"
+                echo "linux_tarball_url=$linux_url"
+                echo "linux_tarball_sha256=$linux_sha256"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          {
+            echo "should_build=true"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "linux_tarball_url=$linux_url"
+            echo "linux_tarball_sha256=$linux_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build macOS arm64 & Web (${{ needs.resolve.outputs.tag }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      SELFHOST_SERVER_URL: https://claude-jp.tailf5a35f.ts.net
+      UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      LINUX_TARBALL_URL: ${{ needs.resolve.outputs.linux_tarball_url }}
+      LINUX_TARBALL_SHA256: ${{ needs.resolve.outputs.linux_tarball_sha256 }}
+    steps:
+      - name: Check out upstream release tag
+        uses: actions/checkout@v7
+        with:
+          repository: yet-another-ai/deskfleet
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
+        with:
+          github-token: ${{ github.token }}
+          rust-cache: release
+          rust-cache-save: "true"
+
+      - name: Ensure Xcode Metal toolchain is available
+        shell: bash
+        run: |
+          if ! xcrun metal -v >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal -v
+
+      - name: Build same-origin Web client
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset VITE_DESKFLEET_SERVER_URL
+          mise exec node -- node scripts/release-version.ts "$UPSTREAM_TAG"
+          mise run web:build
+          test -f apps/web/dist/index.html
+          if grep -rn "claude-jp\.tailf5a35f\.ts\.net" apps/web/dist/; then
+            echo "::error::Same-origin Web build must not embed VITE_DESKFLEET_SERVER_URL."
+            exit 1
+          fi
+          mkdir -p release-out
+          tar -czf release-out/deskfleet-web.tar.gz -C apps/web/dist .
+
+      - name: Mark packaged macOS build as externally managed for updates
+        shell: bash
+        run: |
+          mise exec node -- node --input-type=module <<'EOF'
+          import { readFileSync, writeFileSync } from "node:fs"
+          const path = "apps/desktop/src/main/updates.ts"
+          const src = readFileSync(path, "utf8")
+          const target = 'if (nixManagedDarwinInstall()) return "package_manager"'
+          const replacement = 'if (process.platform === "darwin" || nixManagedDarwinInstall()) return "package_manager"'
+          if (!src.includes(target)) {
+            throw new Error(`Expected update-source check not found in ${path}`)
+          }
+          writeFileSync(path, src.replace(target, replacement))
+          EOF
+
+      - name: Build Electron bundles for self-hosted server
+        shell: bash
+        env:
+          VITE_DESKFLEET_SERVER_URL: ${{ env.SELFHOST_SERVER_URL }}
+        run: mise run desktop:release-build
+
+      - name: Package, ad-hoc sign, verify, and archive macOS app
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          set -euo pipefail
+          mise exec -- pnpm --filter @deskfleet/desktop run package:dir
+
+          app_dir="apps/desktop/release/mac-arm64"
+          if [[ -d "$app_dir/DeskFleet.app" ]]; then
+            app_path="$app_dir/DeskFleet.app"
+          elif [[ -d "$app_dir/deskfleet.app" ]]; then
+            mv "$app_dir/deskfleet.app" "$app_dir/DeskFleet.app"
+            app_path="$app_dir/DeskFleet.app"
+          else
+            echo "::error::Packaged .app bundle not found in $app_dir"
+            ls -la "$app_dir" || true
+            exit 1
+          fi
+
+          # Strip non-adhoc designated requirements from staged helper executables
+          # before sealing the outer bundle so strict deep verification passes.
+          if [[ -f "$app_path/Contents/MacOS/auv" ]]; then
+            codesign --sign - --force "$app_path/Contents/MacOS/auv"
+          fi
+          if [[ -f "$app_path/Contents/Resources/native/deskfleet-viewer" ]]; then
+            codesign --sign - --force "$app_path/Contents/Resources/native/deskfleet-viewer"
+          fi
+          codesign --sign - --force "$app_path"
+          codesign --verify --deep --strict -vv "$app_path"
+
+          mise run desktop:smoke-packaged-dsh
+
+          mise exec node -- node --input-type=module - "$app_path/Contents/Resources/app.asar" "$SELFHOST_SERVER_URL" <<'EOF'
+          import { readFileSync } from "node:fs"
+          const [asarPath, expectedUrl] = process.argv.slice(2)
+          const buf = readFileSync(asarPath)
+          if (!buf.includes(Buffer.from(expectedUrl, "utf8"))) {
+            throw new Error(`Expected server URL ${expectedUrl} not found in ${asarPath}`)
+          }
+          console.log(`Verified ${expectedUrl} in ${asarPath}`)
+          EOF
+
+          zip_name="deskfleet-${VERSION}-mac-arm64.zip"
+          dmg_name="deskfleet-${VERSION}-mac-arm64.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-out/$zip_name"
+          hdiutil create -volname "DeskFleet" -srcfolder "$app_path" -ov -format UDZO "release-out/$dmg_name"
+
+          verify_dir="$(mktemp -d)"
+          ditto -x -k "release-out/$zip_name" "$verify_dir"
+          codesign --verify --deep --strict -vv "$verify_dir/DeskFleet.app"
+          rm -rf "$verify_dir"
+
+          upstream_sha="$(git rev-parse HEAD)"
+          mise exec node -- node --input-type=module - "$UPSTREAM_TAG" "$VERSION" "$upstream_sha" "$SELFHOST_SERVER_URL" "$LINUX_TARBALL_URL" "$LINUX_TARBALL_SHA256" "$zip_name" "$dmg_name" <<'EOF'
+          import { createHash } from "node:crypto"
+          import { readFileSync, writeFileSync } from "node:fs"
+
+          const [upstreamTag, version, upstreamCommit, serverUrl, linuxUrl, linuxSha256, zipName, dmgName] = process.argv.slice(2)
+          const sha256 = (file) => createHash("sha256").update(readFileSync(`release-out/${file}`)).digest("hex")
+
+          const webSha = sha256("deskfleet-web.tar.gz")
+          const zipSha = sha256(zipName)
+          const dmgSha = sha256(dmgName)
+
+          const manifest = {
+            releaseTag: `selfhost-${upstreamTag}`,
+            upstreamTag,
+            version,
+            upstreamCommit,
+            serverUrl,
+            linuxServerArchive: {
+              name: "deskfleet-linux-x64.tar.gz",
+              url: linuxUrl,
+              sha256: linuxSha256,
+            },
+            webArchive: {
+              name: "deskfleet-web.tar.gz",
+              sha256: webSha,
+            },
+            macZip: {
+              name: zipName,
+              sha256: zipSha,
+            },
+            macDmg: {
+              name: dmgName,
+              sha256: dmgSha,
+            },
+          }
+          writeFileSync("release-out/selfhost-manifest.json", JSON.stringify(manifest, null, 2) + "\n")
+          const sums = [
+            `${webSha}  deskfleet-web.tar.gz`,
+            `${zipSha}  ${zipName}`,
+            `${dmgSha}  ${dmgName}`,
+          ].join("\n") + "\n"
+          writeFileSync("release-out/SHA256SUMS", sums)
+          EOF
+
+          (cd release-out && shasum -a 256 -c SHA256SUMS)
+
+      - name: Publish self-hosted GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: selfhost-${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse HEAD)"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Self-hosted DeskFleet macOS arm64 desktop app and same-origin Web bundle built from upstream [\`${UPSTREAM_TAG}\`](https://github.com/yet-another-ai/deskfleet/releases/tag/${UPSTREAM_TAG}) (\`${upstream_sha}\`).
+
+          - **Desktop server origin:** \`${SELFHOST_SERVER_URL}\`
+          - **Upstream Linux x64 archive:** \`deskfleet-linux-x64.tar.gz\` (\`sha256:${LINUX_TARBALL_SHA256}\`)
+
+          \`\`\`text
+          $(cat release-out/SHA256SUMS)
+          \`\`\`
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-out/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --draft=false \
+              --title "Self-hosted DeskFleet ${UPSTREAM_TAG}" \
+              --notes-file "$notes_file"
+          else
+            gh release create "$RELEASE_TAG" release-out/* \
+              --title "Self-hosted DeskFleet ${UPSTREAM_TAG}" \
+              --notes-file "$notes_file"
+          fi
